@@ -3279,11 +3279,23 @@ struct ggml_tensor * ggml_mul_mat(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
         struct ggml_tensor  * b) {
+    return ggml_mul_mat_out(ctx, a, b, GGML_TYPE_F32);
+}
+
+// mul_mat with an explicit result dtype. F16 output lets inference graphs keep
+// activations in F16 between GEMMs: the CUDA backend writes the GEMM result
+// directly as F16 (F32 accumulate), avoiding the hidden F16->F32 output
+// conversion pass. CPU only supports F32 results.
+struct ggml_tensor * ggml_mul_mat_out(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        enum ggml_type        out_type) {
     GGML_ASSERT(ggml_can_mul_mat(a, b));
     GGML_ASSERT(!ggml_is_transposed(a));
 
     const int64_t ne[4] = { a->ne[1], b->ne[1], b->ne[2], b->ne[3] };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    struct ggml_tensor * result = ggml_new_tensor(ctx, out_type, 4, ne);
 
     result->op     = GGML_OP_MUL_MAT;
     result->src[0] = a;
@@ -4252,6 +4264,66 @@ struct ggml_tensor * ggml_rope_multi(
         ctx, a, b, c, n_dims, sections, mode, n_ctx_orig, freq_base, freq_scale,
         ext_factor, attn_factor, beta_fast, beta_slow, false
     );
+}
+
+// rope_multi with an explicit result dtype: lets a F16 activation stream
+// produce an F32 rope output (e.g. flash attention requires F32 Q) without a
+// separate cast pass. The CUDA vision kernel supports F16 in / F32 out.
+struct ggml_tensor * ggml_rope_multi_out(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * c,
+        int                   n_dims,
+        int                   sections[GGML_MROPE_SECTIONS],
+        int                   mode,
+        int                   n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        enum ggml_type        out_type) {
+    GGML_ASSERT((mode & 1) == 0 && "mode & 1 == 1 is no longer supported");
+
+    GGML_ASSERT(ggml_is_vector(b));
+    GGML_ASSERT(b->type == GGML_TYPE_I32);
+
+    bool mrope_used = mode & GGML_ROPE_TYPE_MROPE;
+    if (mrope_used) {
+        GGML_ASSERT(a->ne[2] * 4 == b->ne[0]); // mrope expecting 4 position ids per token
+    } else {
+        GGML_ASSERT(a->ne[2] == b->ne[0]);
+    }
+
+    if (c) {
+        GGML_ASSERT(c->type == GGML_TYPE_F32);
+        GGML_ASSERT(c->ne[0] >= n_dims / 2);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, out_type, 4, a->ne);
+
+    int32_t params[15] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
+    memcpy(params +  5, &freq_base,    sizeof(float));
+    memcpy(params +  6, &freq_scale,   sizeof(float));
+    memcpy(params +  7, &ext_factor,   sizeof(float));
+    memcpy(params +  8, &attn_factor,  sizeof(float));
+    memcpy(params +  9, &beta_fast,    sizeof(float));
+    memcpy(params + 10, &beta_slow,    sizeof(float));
+    if (mrope_used && sections) {
+        memcpy(params + 11, sections,  sizeof(int32_t) * GGML_MROPE_SECTIONS);
+    } else {
+        memset(params + 11, 0,         sizeof(int32_t) * GGML_MROPE_SECTIONS);
+    }
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_ROPE;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = c;
+
+    return result;
 }
 
 struct ggml_tensor * ggml_rope_multi_inplace(

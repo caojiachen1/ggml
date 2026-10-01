@@ -715,6 +715,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         if (cublas_handles[i] != nullptr) {
             CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
         }
+        if (cublaslt_handles[i] != nullptr) {
+            CUBLAS_CHECK(cublasLtDestroy(cublaslt_handles[i]));
+        }
     }
 }
 
@@ -1511,7 +1514,16 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
     }
 
-    if (prefer_f32_output) {
+    // F16-result mul_mat (activations stored in F16 between GEMMs): write the
+    // GEMM output directly into dst, skipping the F16 temp + F32 conversion
+    // round-trip entirely. Requires dst to be contiguous (asserted above).
+    const bool dst_is_compute_type = dst->type == compute_type && compute_type != GGML_TYPE_F32;
+
+    if (dst_is_compute_type) {
+        dst_ptr = (char *) dst->data;
+        nbd2 /= sizeof(float) / sizeof(cuda_t);
+        nbd3 /= sizeof(float) / sizeof(cuda_t);
+    } else if (prefer_f32_output) {
         dst_ptr = (char *) dst_ddf;
         cu_compute_type = batched_mul_mat_traits<GGML_TYPE_F32>::compute_type;
         cu_data_type = batched_mul_mat_traits<GGML_TYPE_F32>::data_type;
@@ -1610,7 +1622,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     }
 
     // Convert output back to F32 if needed
-    if (cu_data_type != CUDA_R_32F) {
+    if (cu_data_type != CUDA_R_32F && !dst_is_compute_type) {
         const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(traits::ggml_type_val);
         to_fp32_cuda(dst_temp.get(), dst_ddf, ne_dst, main_stream);
     }
@@ -1657,6 +1669,90 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         default:
             GGML_ABORT("fatal error");
     }
+}
+
+// F16 GEMM with the bias add folded into the cublasLt epilogue:
+// dst = src0^T @ src1 + bias, bias is a [ne0] F16 vector broadcast over rows.
+// Numerically identical to GEMM-then-ADD (the bias is added to the F32
+// accumulator, so it is at least as accurate). Only the common single 2D
+// GEMM shape (ne2 == ne3 == 1) is handled; returns false to fall back.
+static bool ggml_cuda_mul_mat_bias_cublaslt(ggml_backend_cuda_context & ctx,
+                                            const ggml_tensor * src0,
+                                            const ggml_tensor * src1,
+                                            const ggml_tensor * bias,
+                                            ggml_tensor *       dst,
+                                            const bool          gelu) {
+    if (src0->type != GGML_TYPE_F16 || src1->type != GGML_TYPE_F16 ||
+        dst->type  != GGML_TYPE_F16 || bias->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (dst->ne[2] != 1 || dst->ne[3] != 1) return false;           // single 2D GEMM only
+    if (!ggml_is_contiguous(src0)) return false;
+    if (!ggml_is_contiguous_rows(src1)) return false;
+    if (!ggml_is_contiguous(dst)) return false;
+    if (!ggml_is_contiguous(bias) || bias->ne[0] != dst->ne[0] ||
+        bias->ne[1] != 1 || bias->ne[2] != 1 || bias->ne[3] != 1) {
+        return false;
+    }
+    if (!fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc)) return false;
+
+    const int64_t m = dst->ne[0];
+    const int64_t n = dst->ne[1];
+    const int64_t k = src0->ne[0];
+
+    cublasLtMatmulDesc_t op_desc = nullptr;
+    cublasLtMatrixLayout_t layout_a = nullptr, layout_b = nullptr, layout_c = nullptr;
+    cublasLtMatmulPreference_t pref = nullptr;
+    bool ok = false;
+
+    do {
+        CUBLAS_CHECK(cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+        const cublasOperation_t transa = CUBLAS_OP_T;
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, sizeof(transa)));
+        const cublasLtEpilogue_t epi = gelu ? CUBLASLT_EPILOGUE_GELU_BIAS : CUBLASLT_EPILOGUE_BIAS;
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof(epi)));
+        const void * bias_ptr = bias->data;
+        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias_ptr, sizeof(bias_ptr)));
+
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&layout_a, CUDA_R_16F, k, m, k));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&layout_b, CUDA_R_16F, k, n, src1->nb[1] / ggml_type_size(src1->type)));
+        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&layout_c, CUDA_R_16F, m, n, m));
+
+        CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
+        const size_t ws_size = 32 << 20;
+        CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_size, sizeof(ws_size)));
+
+        ggml_cuda_pool_alloc<char> workspace(ctx.pool());
+        workspace.alloc(ws_size);
+
+        cublasLtMatmulHeuristicResult_t heur;
+        int n_results = 0;
+        const cublasStatus_t st = cublasLtMatmulAlgoGetHeuristic(
+                ctx.cublaslt_handle(), op_desc, layout_a, layout_b, layout_c, layout_c, pref, 1, &heur, &n_results);
+        if (st != CUBLAS_STATUS_SUCCESS || n_results == 0) {
+            break;
+        }
+
+        const float alpha = 1.0f, beta = 0.0f;
+        CUBLAS_CHECK(cublasLtMatmul(ctx.cublaslt_handle(), op_desc,
+                                    &alpha,
+                                    src0->data, layout_a,
+                                    src1->data, layout_b,
+                                    &beta,
+                                    dst->data, layout_c,
+                                    dst->data, layout_c,
+                                    &heur.algo,
+                                    workspace.get(), ws_size,
+                                    ctx.stream()));
+        ok = true;
+    } while (false);
+
+    if (pref      != nullptr) cublasLtMatmulPreferenceDestroy(pref);
+    if (layout_c  != nullptr) cublasLtMatrixLayoutDestroy(layout_c);
+    if (layout_b  != nullptr) cublasLtMatrixLayoutDestroy(layout_b);
+    if (layout_a  != nullptr) cublasLtMatrixLayoutDestroy(layout_a);
+    if (op_desc   != nullptr) cublasLtMatmulDescDestroy(op_desc);
+    return ok;
 }
 
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
@@ -3142,6 +3238,52 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // MUL_MAT + ADD(bias broadcast) -> single cublasLt GEMM with a bias
+    // epilogue. The separate bias ADD pass over the [ne0, ne1] GEMM output
+    // disappears; the bias is added inside the F32 accumulator instead.
+    if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes) {
+        ggml_tensor * add_node = cgraph->nodes[i + 1];
+        if (add_node->op == GGML_OP_ADD) {
+            const ggml_tensor * bias = nullptr;
+            if (add_node->src[0] == node) {
+                bias = add_node->src[1];
+            } else if (add_node->src[1] == node) {
+                bias = add_node->src[0];
+            }
+            if (bias != nullptr && bias->ne[0] == node->ne[0] &&
+                bias->ne[1] == 1 && bias->ne[2] == 1 && bias->ne[3] == 1 &&
+                ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD }, { i + 1 })) {
+                int out_nodes[] = { i + 1 };
+                if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+                    // Optional further fusion with a following GELU: the
+                    // epilogue then computes GELU(x + bias) in one pass.
+                    // cuBLASLt's GELU is the tanh approximation while the
+                    // reference uses exact erf; gate it so it can be disabled.
+                    static const bool lt_gelu = [] {
+                        const char * env = getenv("GGML_CUDA_LT_GELU");
+                        return env == nullptr || atoi(env) != 0;
+                    }();
+                    if (lt_gelu && i + 2 < cgraph->n_nodes) {
+                        ggml_tensor * unary_node = cgraph->nodes[i + 2];
+                        if (unary_node->op == GGML_OP_UNARY &&
+                            ggml_get_unary_op(unary_node) == GGML_UNARY_OP_GELU_ERF &&
+                            unary_node->src[0] == add_node &&
+                            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_UNARY }, { i + 2 })) {
+                            int out3[] = { i + 2 };
+                            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out3, 1) &&
+                                ggml_cuda_mul_mat_bias_cublaslt(*cuda_ctx, node->src[0], node->src[1], bias, unary_node, true)) {
+                                return 2;
+                            }
+                        }
+                    }
+                    if (ggml_cuda_mul_mat_bias_cublaslt(*cuda_ctx, node->src[0], node->src[1], bias, add_node, false)) {
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
@@ -3852,6 +3994,48 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Per-op profiling (GGML_CUDA_PER_OP=1): times every computed node with CUDA
+// events, disables CUDA graph capture so events can be interleaved, and
+// prints an aggregated, sorted report every 100 graph computes. Debug tool.
+// ---------------------------------------------------------------------------
+static bool ggml_cuda_per_op_enabled() {
+    static bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_PER_OP");
+        return env != nullptr && atoi(env) == 1;
+    }();
+    return enabled;
+}
+
+struct ggml_cuda_per_op_stat {
+    double total_ms = 0.0;
+    int64_t count   = 0;
+};
+
+static std::unordered_map<std::string, ggml_cuda_per_op_stat> g_per_op_stats;
+static int64_t g_per_op_evals = 0;
+static cudaEvent_t g_per_op_start = nullptr;
+static cudaEvent_t g_per_op_end   = nullptr;
+
+static void ggml_cuda_per_op_report() {
+    std::vector<std::pair<std::string, ggml_cuda_per_op_stat>> rows(g_per_op_stats.begin(), g_per_op_stats.end());
+    std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) {
+        return a.second.total_ms > b.second.total_ms;
+    });
+    double total = 0.0;
+    for (const auto & [name, st] : rows) total += st.total_ms;
+    printf("================ per-op profile (%lld evals) ================\n", (long long) g_per_op_evals);
+    printf("%9s %8s %10s %7s  %s\n", "total_ms", "n", "us/op", "pct", "op");
+    for (const auto & [name, st] : rows) {
+        printf("%9.2f %8lld %10.1f %6.1f%%  %s\n",
+               st.total_ms, (long long) st.count,
+               st.total_ms * 1000.0 / st.count,
+               100.0 * st.total_ms / total, name.c_str());
+    }
+    printf("total %.2f ms / eval -> %.3f ms/eval\n", total, total / g_per_op_evals);
+    fflush(stdout);
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4017,11 +4201,29 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                if (ggml_cuda_per_op_enabled()) {
+                    if (g_per_op_start == nullptr) {
+                        cudaEventCreate(&g_per_op_start);
+                        cudaEventCreate(&g_per_op_end);
+                    }
+                    CUDA_CHECK(cudaEventRecord(g_per_op_start, cuda_ctx->stream()));
+                }
+
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                if (ggml_cuda_per_op_enabled()) {
+                    CUDA_CHECK(cudaEventRecord(g_per_op_end, cuda_ctx->stream()));
+                    cudaEventSynchronize(g_per_op_end);
+                    float ms = 0.0f;
+                    cudaEventElapsedTime(&ms, g_per_op_start, g_per_op_end);
+                    auto & st = g_per_op_stats[std::string(ggml_op_name(node->op)) + ":" + node->name];
+                    st.total_ms += ms;
+                    st.count   += 1;
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -4127,6 +4329,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    if (use_cuda_graph && ggml_cuda_per_op_enabled()) {
+        // Per-op event timing cannot be captured into a CUDA graph.
+        use_cuda_graph = false;
+    }
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -4138,6 +4345,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (ggml_cuda_per_op_enabled()) {
+        g_per_op_evals++;
+        if (g_per_op_evals % 100 == 0) {
+            ggml_cuda_per_op_report();
+        }
+    }
 
     return GGML_STATUS_SUCCESS;
 }

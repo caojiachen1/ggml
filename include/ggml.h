@@ -1430,6 +1430,16 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    // mul_mat with an explicit result type (see ggml_mul_mat). F16 output is
+    // supported by the CUDA backend: the GEMM is accumulated in F32 and stored
+    // directly as F16, skipping the usual output conversion pass. Use this to
+    // keep activations in F16 between GEMMs.
+    GGML_API struct ggml_tensor * ggml_mul_mat_out(
+            struct ggml_context   * ctx,
+            struct ggml_tensor    * a,
+            struct ggml_tensor    * b,
+            enum ggml_type          out_type);
+
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
     GGML_API void ggml_mul_mat_set_prec(
@@ -1881,6 +1891,26 @@ extern "C" {
             float                 attn_factor,
             float                 beta_fast,
             float                 beta_slow);
+
+    // rope_multi with an explicit result dtype (F16 in / F32 out supported by
+    // the CUDA vision kernel): avoids a separate cast pass when flash
+    // attention needs an F32 Q out of an F16 activation stream.
+    GGML_API struct ggml_tensor * ggml_rope_multi_out(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * c,
+            int                   n_dims,
+            int                   sections[GGML_MROPE_SECTIONS],
+            int                   mode,
+            int                   n_ctx_orig,
+            float                 freq_base,
+            float                 freq_scale,
+            float                 ext_factor,
+            float                 attn_factor,
+            float                 beta_fast,
+            float                 beta_slow,
+            enum ggml_type        out_type);
 
     // in-place, returns view(a)
     GGML_API struct ggml_tensor * ggml_rope_ext_inplace(

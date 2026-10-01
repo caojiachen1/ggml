@@ -1488,6 +1488,20 @@ struct ggml_backend_cuda_context {
         return cublas_handle(device);
     }
 
+    cublasLtHandle_t cublaslt_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
+
+    cublasLtHandle_t cublaslt_handle(int device) {
+        if (cublaslt_handles[device] == nullptr) {
+            ggml_cuda_set_device(device);
+            CUBLAS_CHECK(cublasLtCreate(&cublaslt_handles[device]));
+        }
+        return cublaslt_handles[device];
+    }
+
+    cublasLtHandle_t cublaslt_handle() {
+        return cublaslt_handle(device);
+    }
+
     // pool
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
 

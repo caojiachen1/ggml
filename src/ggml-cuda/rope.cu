@@ -267,9 +267,9 @@ static __global__ void rope_multi(const T *            x,
     dst[idst + n_dims/2] = x0*sin_theta + x1*cos_theta;
 }
 
-template <bool forward, bool has_ff, typename T>
+template <bool forward, bool has_ff, typename T, typename DstT>
 static __global__ void rope_vision(const T *            x,
-                                   T *                  dst,
+                                   DstT *              dst,
                                    const int            ne00,
                                    const int            ne01,
                                    const int            ne02,
@@ -327,8 +327,8 @@ static __global__ void rope_vision(const T *            x,
     const float x0 = x[ix + 0];
     const float x1 = x[ix + n_dims];
 
-    dst[idst + 0]      = x0*cos_theta - x1*sin_theta;
-    dst[idst + n_dims] = x0*sin_theta + x1*cos_theta;
+    dst[idst + 0]      = ggml_cuda_cast<DstT>(x0*cos_theta - x1*sin_theta);
+    dst[idst + n_dims] = ggml_cuda_cast<DstT>(x0*sin_theta + x1*cos_theta);
 }
 
 template <bool forward, typename T, typename D>
@@ -460,9 +460,9 @@ static void rope_multi_cuda(const T *            x,
     }
 }
 
-template <bool forward, typename T>
+template <bool forward, typename T, typename DstT>
 static void rope_vision_cuda(const T *            x,
-                             T *                  dst,
+                             DstT *              dst,
                              const int            ne00,
                              const int            ne01,
                              const int            ne02,
@@ -493,11 +493,11 @@ static void rope_vision_cuda(const T *            x,
     const float theta_scale = powf(freq_base, -2.0f/n_dims);
 
     if (freq_factors == nullptr) {
-        rope_vision<forward, false, T><<<block_nums, block_dims, 0, stream>>>(
+        rope_vision<forward, false, T, DstT><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
             attn_factor, corr_dims, theta_scale, freq_factors, sections);
     } else {
-        rope_vision<forward, true, T><<<block_nums, block_dims, 0, stream>>>(
+        rope_vision<forward, true, T, DstT><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, pos, freq_scale, ext_factor,
             attn_factor, corr_dims, theta_scale, freq_factors, sections);
     }
@@ -532,7 +532,8 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
     GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
     // When not fused, src0 and dst types must match
     // When fused (ROPE+VIEW+SET_ROWS), src0 may be F32 and dst may be F16
-    GGML_ASSERT(src0->type == dst->type || (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16));
+    GGML_ASSERT(src0->type == dst->type || (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) ||
+                (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32));
 
     const int64_t ne00 = src0->ne[0]; // head dims
     const int64_t ne01 = src0->ne[1]; // num heads
@@ -626,12 +627,16 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
             GGML_ABORT("fatal error");
         }
     } else if (is_vision) {
-        if (src0->type == GGML_TYPE_F32) {
-            rope_vision_cuda<forward>((const float *) src0_d, (float *) dst_d, ne00, ne01, ne02, s01, s02, s03, s1,
+        if (src0->type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F32) {
+            rope_vision_cuda<forward, float, float>((const float *) src0_d, (float *) dst_d, ne00, ne01, ne02, s01, s02, s03, s1,
                                       s2, s3, n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor,
                                       corr_dims, freq_factors, sections, stream);
-        } else if (src0->type == GGML_TYPE_F16) {
-            rope_vision_cuda<forward>((const half *) src0_d, (half *) dst_d, ne00, ne01, ne02, s01, s02, s03, s1,
+        } else if (src0->type == GGML_TYPE_F16 && dst_type == GGML_TYPE_F16) {
+            rope_vision_cuda<forward, half, half>((const half *) src0_d, (half *) dst_d, ne00, ne01, ne02, s01, s02, s03, s1,
+                                      s2, s3, n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor,
+                                      corr_dims, freq_factors, sections, stream);
+        } else if (src0->type == GGML_TYPE_F16 && dst_type == GGML_TYPE_F32) {
+            rope_vision_cuda<forward, half, float>((const half *) src0_d, (float *) dst_d, ne00, ne01, ne02, s01, s02, s03, s1,
                                       s2, s3, n_dims, nr, pos, freq_scale, freq_base, ext_factor, attn_factor,
                                       corr_dims, freq_factors, sections, stream);
         } else {
