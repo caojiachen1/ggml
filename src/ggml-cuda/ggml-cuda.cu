@@ -1680,6 +1680,7 @@ static bool ggml_cuda_mul_mat_bias_cublaslt(ggml_backend_cuda_context & ctx,
                                             const ggml_tensor * src0,
                                             const ggml_tensor * src1,
                                             const ggml_tensor * bias,
+                                            const ggml_tensor * residual, // optional [ne0, ne1] F16, added via beta=1
                                             ggml_tensor *       dst,
                                             const bool          gelu) {
     if (src0->type != GGML_TYPE_F16 || src1->type != GGML_TYPE_F16 ||
@@ -1693,6 +1694,14 @@ static bool ggml_cuda_mul_mat_bias_cublaslt(ggml_backend_cuda_context & ctx,
     if (!ggml_is_contiguous(bias) || bias->ne[0] != dst->ne[0] ||
         bias->ne[1] != 1 || bias->ne[2] != 1 || bias->ne[3] != 1) {
         return false;
+    }
+    if (residual != nullptr) {
+        if (residual->type != GGML_TYPE_F16 ||
+            residual->ne[0] != dst->ne[0] || residual->ne[1] != dst->ne[1] ||
+            residual->ne[2] != 1 || residual->ne[3] != 1 ||
+            !ggml_is_contiguous(residual)) {
+            return false;
+        }
     }
     if (!fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc)) return false;
 
@@ -1733,13 +1742,14 @@ static bool ggml_cuda_mul_mat_bias_cublaslt(ggml_backend_cuda_context & ctx,
             break;
         }
 
-        const float alpha = 1.0f, beta = 0.0f;
+        const float alpha = 1.0f, beta = residual != nullptr ? 1.0f : 0.0f;
+        const void * c_ptr = residual != nullptr ? residual->data : dst->data;
         CUBLAS_CHECK(cublasLtMatmul(ctx.cublaslt_handle(), op_desc,
                                     &alpha,
                                     src0->data, layout_a,
                                     src1->data, layout_b,
                                     &beta,
-                                    dst->data, layout_c,
+                                    c_ptr, layout_c,
                                     dst->data, layout_c,
                                     &heur.algo,
                                     workspace.get(), ws_size,
@@ -3271,12 +3281,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                             ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_UNARY }, { i + 2 })) {
                             int out3[] = { i + 2 };
                             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out3, 1) &&
-                                ggml_cuda_mul_mat_bias_cublaslt(*cuda_ctx, node->src[0], node->src[1], bias, unary_node, true)) {
+                                ggml_cuda_mul_mat_bias_cublaslt(*cuda_ctx, node->src[0], node->src[1], bias, nullptr, unary_node, true)) {
                                 return 2;
                             }
                         }
                     }
-                    if (ggml_cuda_mul_mat_bias_cublaslt(*cuda_ctx, node->src[0], node->src[1], bias, add_node, false)) {
+                    // Optional further fusion with a residual ADD: dst = A@B +
+                    // bias + residual via beta=1 with C = the residual matrix.
+                    if (i + 2 < cgraph->n_nodes) {
+                        ggml_tensor * res_node = cgraph->nodes[i + 2];
+                        if (res_node->op == GGML_OP_ADD &&
+                            (res_node->src[0] == add_node || res_node->src[1] == add_node)) {
+                            ggml_tensor * residual = res_node->src[0] == add_node ? res_node->src[1] : res_node->src[0];
+                            if (residual->ne[0] == node->ne[0] && residual->ne[1] == node->ne[1] &&
+                                residual->ne[2] == 1 && residual->ne[3] == 1 &&
+                                ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD }, { i + 2 })) {
+                                int out3[] = { i + 2 };
+                                if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out3, 1) &&
+                                    ggml_cuda_mul_mat_bias_cublaslt(*cuda_ctx, node->src[0], node->src[1], bias, residual, res_node, false)) {
+                                    return 2;
+                                }
+                            }
+                        }
+                    }
+                    if (ggml_cuda_mul_mat_bias_cublaslt(*cuda_ctx, node->src[0], node->src[1], bias, nullptr, add_node, false)) {
                         return 1;
                     }
                 }
