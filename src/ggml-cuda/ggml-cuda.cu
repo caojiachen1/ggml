@@ -70,6 +70,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/ppdl-ops.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -91,6 +92,7 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <chrono>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -2415,6 +2417,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
+            break;
+        case GGML_OP_CUSTOM: // patched for ppdoclayout: tagged custom ops run on GPU
+            if (!ggml_cuda_compute_forward_ppdl(ctx, dst)) {
+                return false;
+            }
             break;
         default:
             return false;
@@ -5592,6 +5599,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_CUSTOM: // patched for ppdoclayout: tagged custom ops on GPU
+            return ggml_cuda_supports_ppdl_op(op);
 
         default:
             return false;

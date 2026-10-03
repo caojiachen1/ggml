@@ -1,4 +1,5 @@
 #include "im2col.cuh"
+#include "ggml-cuda/ppdl-ops.cuh"
 
 #define MAX_GRIDDIM_Y 65535
 #define MAX_GRIDDIM_Z 65535
@@ -114,7 +115,11 @@ void ggml_cuda_op_im2col(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if(dst->type == GGML_TYPE_F16) {
         im2col_cuda_f16(src1_d, (half *) dst_d, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
     } else {
-        im2col_cuda_f32(src1_d, (float *) dst_d, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
+        // patched for ppdoclayout: coalesced F32 im2col (stock kernel is
+        // scheduling-bound for small IC*KH*KW); falls back if unsupported
+        if (!ggml_cuda_ppdl_im2col_f32(src1_d, (float *) dst_d, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream)) {
+            im2col_cuda_f32(src1_d, (float *) dst_d, IW, IH, OW, OH, KW, KH, IC, N, IC_IH_IW, IH_IW, s0, s1, p0, p1, d0, d1, stream);
+        }
     }
 }
 
